@@ -117,6 +117,23 @@ type GlobalConfig struct {
 	DeletionStrategy string `yaml:"deletionStrategy" json:"deletionStrategy,omitempty"`
 }
 
+// Stage defines staged execution behavior for an object
+type Stage struct {
+	// Number is the stage number (lower executes first). Default 0.
+	// Objects with the same stage number are created together across all iterations
+	// before moving to the next stage.
+	Number int `yaml:"number" json:"number,omitempty"`
+	// PauseBeforeCleanup is the duration to wait after creating all objects
+	// in this stage and waiting for readiness, before cleanup begins
+	PauseBeforeCleanup time.Duration `yaml:"pauseBeforeCleanup" json:"pauseBeforeCleanup,omitempty"`
+	// Cleanup determines whether to delete objects created by this template
+	// after PauseBeforeCleanup. Default false.
+	Cleanup bool `yaml:"cleanup" json:"cleanup,omitempty"`
+	// PauseAfterCleanup is the duration to wait after cleanup completes
+	// before proceeding to the next stage
+	PauseAfterCleanup time.Duration `yaml:"pauseAfterCleanup" json:"pauseAfterCleanup,omitempty"`
+}
+
 // Object defines an object that kube-burner will create
 type Object struct {
 	// ObjectTemplate path to a valid YAML definition of a k8s resource
@@ -144,6 +161,20 @@ type Object struct {
 	KubeVirtOp KubeVirtOpType `yaml:"kubeVirtOp" json:"kubeVirtOp,omitempty"`
 	// Churn object
 	Churn bool `yaml:"churn" json:"churn,omitempty"`
+	// Stage defines staged execution behavior for this object.
+	// When any object has Stage.Number > 0, staged execution is enabled.
+	Stage Stage `yaml:"stage" json:"stage,omitempty"`
+	// Scope defines whether the object is cluster-scoped or namespace-scoped.
+	// Valid values are "cluster" or "namespace". Default is "namespace".
+	// When "cluster", kube-burner will not use namespace when creating the resource.
+	// When "namespace", kube-burner will use the namespace from the iteration.
+	Scope string `yaml:"scope" json:"scope,omitempty"`
+	// NamespacesPerObject specifies how many namespaces share this object.
+	// When set > 1, the object is created only once per N iterations.
+	// Template receives adjusted Iteration: iteration / namespacesPerObject.
+	// Default 1 means normal behavior (one object per iteration).
+	// Typically used with scope: "cluster" for shared cluster-scoped objects.
+	NamespacesPerObject int `yaml:"namespacesPerObject" json:"namespacesPerObject,omitempty"`
 }
 
 // Job defines a kube-burner job
@@ -347,8 +378,20 @@ const (
 	KubeBurnerLabelJobIteration             = "kube-burner.io/job-iteration"
 	KubeBurnerLabelReplica                  = "kube-burner.io/replica"
 	KubeBurnerLabelChurnDelete              = "kube-burner.io/churn-delete"
+	KubeBurnerLabelStage                    = "kube-burner.io/stage"
 	KubeBurnerLabelServiceLatency           = "kube-burner.io/service-latency"
 	KubeBurnerLabelSkipNetworkPolicyLatency = "kube-burner.io/skip-networkpolicy-latency"
+	KubeBurnerLabelSkipPodLatency           = "kube-burner.io/skip-pod-latency"
+)
+
+// ObjectScope defines whether an object is cluster-scoped or namespace-scoped
+type ObjectScope string
+
+const (
+	// ScopeCluster indicates a cluster-scoped object (no namespace)
+	ScopeCluster ObjectScope = "cluster"
+	// ScopeNamespace indicates a namespace-scoped object (default)
+	ScopeNamespace ObjectScope = "namespace"
 )
 
 // MetricsCLosing strategy

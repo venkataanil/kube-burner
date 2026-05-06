@@ -103,13 +103,25 @@ func newExecutor(configSpec config.Spec, kubeClientProvider *config.KubeClientPr
 }
 
 func (ex *JobExecutor) renderTemplateForObject(obj *object, iteration, replicaIndex int, asJson bool) []byte {
+	// Calculate adjusted iteration for namespacesPerObject
+	adjustedIteration := iteration
+	npo := obj.NamespacesPerObject
+	if npo < 1 {
+		npo = 1
+	}
+	if npo > 1 {
+		adjustedIteration = iteration / npo
+	}
+
 	// Processing template
 	templateData := map[string]any{
-		jobName:      ex.Name,
-		jobIteration: iteration,
-		jobUUID:      ex.uuid,
-		jobRunId:     ex.runid,
-		replica:      replicaIndex,
+		jobName:             ex.Name,
+		jobIteration:        adjustedIteration,
+		jobUUID:             ex.uuid,
+		jobRunId:            ex.runid,
+		replica:             replicaIndex,
+		namespacesPerObject: npo,
+		jobIterations:       ex.JobIterations,
 	}
 	maps.Copy(templateData, obj.InputVars)
 
@@ -136,13 +148,25 @@ func (ex *JobExecutor) renderTemplateForObject(obj *object, iteration, replicaIn
 }
 
 func (ex *JobExecutor) renderTemplateForObjectMultiple(obj *object, iteration, replicaIndex int) ([]*unstructured.Unstructured, []*schema.GroupVersionKind) {
+	// Calculate adjusted iteration for namespacesPerObject
+	adjustedIteration := iteration
+	npo := obj.NamespacesPerObject
+	if npo < 1 {
+		npo = 1
+	}
+	if npo > 1 {
+		adjustedIteration = iteration / npo
+	}
+
 	// Processing template
 	templateData := map[string]any{
-		jobName:      ex.Name,
-		jobIteration: iteration,
-		jobUUID:      ex.uuid,
-		jobRunId:     ex.runid,
-		replica:      replicaIndex,
+		jobName:             ex.Name,
+		jobIteration:        adjustedIteration,
+		jobUUID:             ex.uuid,
+		jobRunId:            ex.runid,
+		replica:             replicaIndex,
+		namespacesPerObject: npo,
+		jobIterations:       ex.JobIterations,
 	}
 	maps.Copy(templateData, obj.InputVars)
 

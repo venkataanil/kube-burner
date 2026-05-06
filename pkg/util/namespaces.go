@@ -55,6 +55,26 @@ func CreateNamespace(clientSet kubernetes.Interface, name string, nsLabels map[s
 	}, 5*time.Second, 3, 0, 5*time.Hour)
 }
 
+func CleanupNamespacesByLabelNoWait(ctx context.Context, clientSet kubernetes.Interface, labelSelector string) error {
+	ns, err := clientSet.CoreV1().Namespaces().List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		return fmt.Errorf("error listing namespaces: %v", err.Error())
+	}
+	if len(ns.Items) > 0 {
+		log.Infof("Deleting %d namespaces with label: %s", len(ns.Items), labelSelector)
+		for _, ns := range ns.Items {
+			err := clientSet.CoreV1().Namespaces().Delete(ctx, ns.Name, metav1.DeleteOptions{})
+			if err != nil {
+				if !errors.IsNotFound(err) {
+					return fmt.Errorf("error deleting namespace %s: %v", ns.Name, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+
 // CleanupNamespacesByLabel deletes namespaces with the given selector
 func CleanupNamespacesByLabel(ctx context.Context, clientSet kubernetes.Interface, labelSelector string) error {
 	ns, err := clientSet.CoreV1().Namespaces().List(ctx, metav1.ListOptions{LabelSelector: labelSelector})

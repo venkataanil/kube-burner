@@ -160,6 +160,11 @@ func (ex *JobExecutor) Verify(ctx context.Context, expectedIterations *int) bool
 	success := true
 	log.Info("Verifying created objects")
 	for objectIndex, obj := range ex.objects {
+		// Skip objects that were cleaned up as part of staged execution
+		if obj.Stage.Cleanup {
+			log.Debugf("Skipping verification for %s (stage cleanup enabled)", obj.gvr.Resource)
+			continue
+		}
 		selector := labels.Set{
 			config.KubeBurnerLabelUUID:  ex.uuid,
 			config.KubeBurnerLabelRunID: ex.runid,
@@ -193,12 +198,27 @@ func (ex *JobExecutor) Verify(ctx context.Context, expectedIterations *int) bool
 			continue
 		}
 		var objectsExpected int
+		npo := obj.NamespacesPerObject
+		if npo < 1 {
+			npo = 1
+		}
+
 		if obj.RunOnce {
 			objectsExpected = obj.Replicas
 		} else if expectedIterations != nil {
-			objectsExpected = obj.Replicas * (*expectedIterations)
+			effectiveIterations := *expectedIterations
+			if npo > 1 {
+				// Ceiling division: objects created at iterations 0, npo, 2*npo, ...
+				effectiveIterations = (*expectedIterations + npo - 1) / npo
+			}
+			objectsExpected = obj.Replicas * effectiveIterations
 		} else {
-			objectsExpected = obj.Replicas * ex.JobIterations
+			effectiveIterations := ex.JobIterations
+			if npo > 1 {
+				// Ceiling division: objects created at iterations 0, npo, 2*npo, ...
+				effectiveIterations = (ex.JobIterations + npo - 1) / npo
+			}
+			objectsExpected = obj.Replicas * effectiveIterations
 		}
 		if replicas != objectsExpected {
 			log.Errorf("%s found: %d Expected: %d", obj.gvr.Resource, replicas, objectsExpected)

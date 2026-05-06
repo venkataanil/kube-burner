@@ -52,6 +52,103 @@ type churnDeletedObject struct {
 	gvr    schema.GroupVersionResource
 }
 
+// stageGroup represents all objects belonging to a specific stage
+type stageGroup struct {
+	number  int
+	objects []*object
+}
+
+// shouldCreateForIteration checks if an object should be created for the given iteration
+// based on its NamespacesPerObject setting
+func shouldCreateForIteration(obj *object, iteration int) bool {
+	npo := obj.NamespacesPerObject
+	if npo < 1 {
+		npo = 1
+	}
+	return iteration%npo == 0
+}
+
+// getMaxNamespacesPerObject returns the maximum NamespacesPerObject value across all objects
+func (ex *JobExecutor) getMaxNamespacesPerObject() int {
+	maxNpo := 1
+	for _, obj := range ex.objects {
+		if obj.NamespacesPerObject > maxNpo {
+			maxNpo = obj.NamespacesPerObject
+		}
+	}
+	return maxNpo
+}
+
+// deleteSharedObjectsForIterations deletes cluster-scoped shared objects
+// that were created for iterations in the given range
+func (ex *JobExecutor) deleteSharedObjectsForIterations(ctx context.Context, iterationStart, iterationEnd int) {
+	for _, obj := range ex.objects {
+		if obj.NamespacesPerObject <= 1 {
+			continue
+		}
+		npo := obj.NamespacesPerObject
+
+		// Find iterations where this object was created within the churn range
+		for i := iterationStart; i < iterationEnd; i++ {
+			if i%npo == 0 {
+				// Object was created at this iteration, delete it
+				labelSelector := fmt.Sprintf("%s=%s,%s=%s,%s=%d",
+					config.KubeBurnerLabelJob, ex.Name,
+					config.KubeBurnerLabelUUID, ex.uuid,
+					config.KubeBurnerLabelJobIteration, i)
+
+				log.Infof("Deleting shared object %s at iteration %d (namespacesPerObject=%d)",
+					obj.ObjectTemplate, i, npo)
+
+				err := ex.dynamicClient.Resource(obj.gvr).DeleteCollection(ctx,
+					metav1.DeleteOptions{},
+					metav1.ListOptions{LabelSelector: labelSelector})
+				if err != nil {
+					log.Errorf("Error deleting shared object %s at iteration %d: %v",
+						obj.ObjectTemplate, i, err)
+				}
+			}
+		}
+	}
+}
+
+// groupObjectsByStage organizes objects into stage groups, sorted by stage number
+func (ex *JobExecutor) groupObjectsByStage() []stageGroup {
+	stageMap := make(map[int][]*object)
+	for _, obj := range ex.objects {
+		stageNum := obj.Stage.Number
+		stageMap[stageNum] = append(stageMap[stageNum], obj)
+	}
+
+	var groups []stageGroup
+	for num, objs := range stageMap {
+		groups = append(groups, stageGroup{number: num, objects: objs})
+	}
+
+	sort.Slice(groups, func(i, j int) bool {
+		return groups[i].number < groups[j].number
+	})
+
+	return groups
+}
+
+// getMaxPauseForStage returns the maximum pauseBeforeCleanup and pauseAfterCleanup
+// among all objects in a stage that have cleanup enabled
+func getMaxPauseForStage(sg stageGroup) (pauseBefore, pauseAfter time.Duration, hasCleanup bool) {
+	for _, obj := range sg.objects {
+		if obj.Stage.Cleanup {
+			hasCleanup = true
+			if obj.Stage.PauseBeforeCleanup > pauseBefore {
+				pauseBefore = obj.Stage.PauseBeforeCleanup
+			}
+			if obj.Stage.PauseAfterCleanup > pauseAfter {
+				pauseAfter = obj.Stage.PauseAfterCleanup
+			}
+		}
+	}
+	return
+}
+
 func (ex *JobExecutor) setupCreateJob() {
 	var f io.ReadCloser
 	var err error
@@ -96,6 +193,12 @@ func (ex *JobExecutor) setupCreateJob() {
 			} else {
 				obj.gvr = schema.GroupVersionResource{}
 			}
+			// Override namespaced based on explicit Scope setting
+			if o.Scope == string(config.ScopeCluster) {
+				obj.namespaced = false
+			} else if o.Scope == string(config.ScopeNamespace) {
+				obj.namespaced = true
+			}
 			// Job requires namespaces when one of the objects is namespaced and doesn't have any namespace specified
 			if obj.namespaced && obj.namespace == "" {
 				ex.nsRequired = true
@@ -108,7 +211,10 @@ func (ex *JobExecutor) setupCreateJob() {
 	}
 }
 
-// RunCreateJob executes a creation job
+// RunCreateJob executes a creation job with staged object creation.
+// Objects are grouped by stage number (default 0), and all iterations of stage N
+// complete before stage N+1 begins. When no staging is configured, all objects
+// are in stage 0 and execute together.
 func (ex *JobExecutor) RunCreateJob(ctx context.Context, iterationStart, iterationEnd int) []error {
 	nsAnnotations := make(map[string]string)
 	nsLabels := map[string]string{
@@ -117,88 +223,185 @@ func (ex *JobExecutor) RunCreateJob(ctx context.Context, iterationStart, iterati
 		config.KubeBurnerLabelRunID: ex.runid,
 	}
 	var wg sync.WaitGroup
-	var ns string
 	var waitErrors []error
-	var namespacesWaited = make(map[string]bool)
 	var hookErrors []error
 	maps.Copy(nsLabels, ex.NamespaceLabels)
 	maps.Copy(nsAnnotations, ex.NamespaceAnnotations)
-	if ex.nsRequired && !ex.NamespacedIterations {
-		ns = ex.createNamespace(ex.Namespace, nsLabels, nsAnnotations)
-	}
-	// We have to sum 1 since the iterations start from 1
-	iterationProgress := (iterationEnd - iterationStart) / 10
-	percent := 1
 
-	for i := iterationStart; i < iterationEnd; i++ {
-		// Execute onEachIteration hooks
-		if ex.executeHooksForJobStage(config.HookOnEachIteration, &hookErrors, nil); len(hookErrors) > 0 {
-			log.Errorf("%v", hookErrors)
+	// Group objects by stage
+	stageGroups := ex.groupObjectsByStage()
+	log.Infof("Staged execution enabled with %d stages", len(stageGroups))
+
+	// Phase 1: Create all namespaces upfront
+	if ex.nsRequired {
+		log.Info("Creating all namespaces before staged execution")
+		if ex.NamespacedIterations {
+			for i := iterationStart; i < iterationEnd; i++ {
+				ex.createNamespace(ex.generateNamespace(i), nsLabels, nsAnnotations)
+			}
+		} else {
+			ex.createNamespace(ex.Namespace, nsLabels, nsAnnotations)
 		}
+	}
+
+	// Phase 2: Execute each stage in order
+	for _, stage := range stageGroups {
 		if ctx.Err() != nil {
 			return []error{ctx.Err()}
 		}
-		if ex.JobIterations > 1 && i == iterationStart+iterationProgress*percent {
-			log.Infof("%v/%v iterations completed", i-iterationStart, iterationEnd-iterationStart)
-			percent++
-		}
-		if ex.nsRequired && ex.NamespacedIterations {
-			ns = ex.createNamespace(ex.generateNamespace(i), nsLabels, nsAnnotations)
-		}
-		log.Debugf("Creating object replicas from iteration %d", i)
-		for objectIndex, obj := range ex.objects {
-			if obj.gvr == (schema.GroupVersionResource{}) {
-				// resolveObjectMapping may set ex.nsRequired to true if the object is namespaced but doesn't have a namespace specified
-				ex.resolveObjectMapping(obj)
-				if ex.nsRequired {
-					nsName := ex.Namespace
-					if ex.NamespacedIterations {
-						nsName = ex.generateNamespace(i)
-					}
-					ns = ex.createNamespace(nsName, nsLabels, nsAnnotations)
+
+		log.Infof("Starting stage %d with %d object templates", stage.number, len(stage.objects))
+		stageCreatedNamespaces := make(map[string]bool)
+
+		// Create all objects for all iterations in this stage
+		for i := iterationStart; i < iterationEnd; i++ {
+			// Execute onEachIteration hooks
+			if ex.executeHooksForJobStage(config.HookOnEachIteration, &hookErrors, nil); len(hookErrors) > 0 {
+				log.Errorf("%v", hookErrors)
+			}
+			if ctx.Err() != nil {
+				return []error{ctx.Err()}
+			}
+
+			var ns string
+			if ex.nsRequired {
+				if ex.NamespacedIterations {
+					ns = ex.generateNamespace(i)
+				} else {
+					ns = ex.Namespace
 				}
+				stageCreatedNamespaces[ns] = true
 			}
-			kbLabels := map[string]string{
-				config.KubeBurnerLabelUUID:         ex.uuid,
-				config.KubeBurnerLabelJob:          ex.Name,
-				config.KubeBurnerLabelIndex:        strconv.Itoa(objectIndex),
-				config.KubeBurnerLabelRunID:        ex.runid,
-				config.KubeBurnerLabelJobIteration: strconv.Itoa(i),
-			}
-			ex.objects[objectIndex].LabelSelector = kbLabels
-			if obj.RunOnce {
-				if i == 0 {
-					// this executes only once during the first iteration of an object
-					log.Debugf("RunOnce set to %s, so creating object once", obj.ObjectTemplate)
+
+			log.Debugf("Stage %d: Creating object replicas from iteration %d", stage.number, i)
+			for objectIndex, obj := range stage.objects {
+				// Resolve GVR if not already done
+				if obj.gvr == (schema.GroupVersionResource{}) {
+					ex.resolveObjectMapping(obj)
+				}
+				kbLabels := map[string]string{
+					config.KubeBurnerLabelUUID:         ex.uuid,
+					config.KubeBurnerLabelJob:          ex.Name,
+					config.KubeBurnerLabelIndex:        strconv.Itoa(objectIndex),
+					config.KubeBurnerLabelRunID:        ex.runid,
+					config.KubeBurnerLabelJobIteration: strconv.Itoa(i),
+				}
+				// Find the actual object index in ex.objects for consistency
+				for idx, o := range ex.objects {
+					if o == obj {
+						kbLabels[config.KubeBurnerLabelIndex] = strconv.Itoa(idx)
+						break
+					}
+				}
+				ex.objects[objectIndex].LabelSelector = kbLabels
+				if obj.RunOnce {
+					if i == 0 {
+						log.Debugf("RunOnce set to %s, so creating object once", obj.ObjectTemplate)
+						ex.replicaHandler(ctx, kbLabels, obj, ns, i, &wg)
+					}
+				} else if obj.NamespacesPerObject > 1 {
+					// Only create when iteration is a multiple of namespacesPerObject
+					if shouldCreateForIteration(obj, i) {
+						log.Debugf("NamespacesPerObject=%d: creating %s at iteration %d",
+							obj.NamespacesPerObject, obj.ObjectTemplate, i)
+						ex.replicaHandler(ctx, kbLabels, obj, ns, i, &wg)
+					}
+				} else {
 					ex.replicaHandler(ctx, kbLabels, obj, ns, i, &wg)
 				}
-			} else {
-				ex.replicaHandler(ctx, kbLabels, obj, ns, i, &wg)
+			}
+
+			if ex.JobIterationDelay > 0 {
+				log.Infof("Sleeping for %v", ex.JobIterationDelay)
+				time.Sleep(ex.JobIterationDelay)
 			}
 		}
-		if !ex.WaitWhenFinished && ex.PodWait {
-			if !ex.NamespacedIterations || !namespacesWaited[ns] {
-				log.Infof("Waiting up to %s for actions to be completed in namespace %s", ex.MaxWaitTimeout, ns)
-				wg.Wait()
+
+		// Wait for all replicas in this stage to be created
+		wg.Wait()
+
+		// Wait for object readiness if configured
+		if ex.PodWait || ex.WaitWhenFinished {
+			log.Infof("Stage %d: Waiting for objects to be ready", stage.number)
+			for ns := range stageCreatedNamespaces {
 				if errs := ex.waitForObjects(ctx, ns); errs != nil {
 					waitErrors = append(waitErrors, errs...)
 				}
-				namespacesWaited[ns] = true
 			}
 		}
-		if ex.JobIterationDelay > 0 {
-			log.Infof("Sleeping for %v", ex.JobIterationDelay)
-			time.Sleep(ex.JobIterationDelay)
+
+		// Handle stage cleanup
+		pauseBefore, pauseAfter, hasCleanup := getMaxPauseForStage(stage)
+
+		if pauseBefore > 0 {
+			log.Infof("Stage %d: Pausing for %v before cleanup", stage.number, pauseBefore)
+			time.Sleep(pauseBefore)
 		}
-	}
-	// Wait for all replicas to be created
-	wg.Wait()
-	if ex.WaitWhenFinished {
-		if errs := ex.waitForCompletion(ctx, iterationStart, iterationEnd, ns, namespacesWaited); len(errs) > 0 {
-			waitErrors = append(waitErrors, errs...)
+
+		if hasCleanup {
+			log.Infof("Stage %d: Cleaning up objects with cleanup=true", stage.number)
+			if err := ex.cleanupStageObjects(ctx, stage); err != nil {
+				waitErrors = append(waitErrors, err)
+			}
 		}
+
+		if pauseAfter > 0 {
+			log.Infof("Stage %d: Pausing for %v after cleanup", stage.number, pauseAfter)
+			time.Sleep(pauseAfter)
+		}
+
+		log.Infof("Stage %d completed", stage.number)
 	}
+
 	return waitErrors
+}
+
+// cleanupStageObjects deletes objects from a stage that have cleanup=true
+func (ex *JobExecutor) cleanupStageObjects(ctx context.Context, stage stageGroup) error {
+	var wg sync.WaitGroup
+	var errs []error
+	var errMu sync.Mutex
+
+	for _, obj := range stage.objects {
+		if !obj.Stage.Cleanup {
+			continue
+		}
+
+		labelSelector := fmt.Sprintf("%s=%s,%s=%d",
+			config.KubeBurnerLabelJob, ex.Name,
+			config.KubeBurnerLabelStage, stage.number)
+
+		log.Infof("Cleaning up %s objects from stage %d", obj.Kind, stage.number)
+
+		// Handle namespaced objects
+		if obj.namespaced {
+			for ns := range ex.createdNamespaces {
+				if !ex.createdNamespaces[ns] {
+					continue
+				}
+				wg.Add(1)
+				go func(namespace string, o *object) {
+					defer wg.Done()
+					CleanupNamespaceResourcesByLabel(ctx, *ex, o, namespace, labelSelector)
+					if err := waitForDeleteResourceInNamespace(ctx, *ex, o, namespace, labelSelector); err != nil {
+						errMu.Lock()
+						errs = append(errs, fmt.Errorf("error waiting for %s deletion in %s: %v", o.Kind, namespace, err))
+						errMu.Unlock()
+					}
+				}(ns, obj)
+			}
+		} else {
+			// Handle non-namespaced objects
+			CleanupNonNamespacedResourcesByLabel(ctx, *ex, obj, labelSelector)
+		}
+	}
+
+	wg.Wait()
+
+	if len(errs) > 0 {
+		return fmt.Errorf("stage cleanup errors: %v", errs)
+	}
+	return nil
 }
 
 // Simple integer division on the iteration allows us to batch iterations into
@@ -220,6 +423,7 @@ func (ex *JobExecutor) replicaHandler(ctx context.Context, labels map[string]str
 		copiedLabels := make(map[string]string)
 		maps.Copy(copiedLabels, labels)
 		copiedLabels[config.KubeBurnerLabelReplica] = strconv.Itoa(r)
+		copiedLabels[config.KubeBurnerLabelStage] = strconv.Itoa(obj.Stage.Number)
 
 		if err := ex.limiter.Wait(ctx); err != nil {
 			return
@@ -387,7 +591,7 @@ func (ex *JobExecutor) RunCreateJobWithChurn(ctx context.Context) []error {
 	var hookErrors []error
 	switch ex.ChurnConfig.Mode {
 	case config.ChurnNamespaces:
-		ex.nsChurning = true // Enable namespace churning flag to prevent non namespaced objects to be churned
+		ex.nsChurning = false // Enable namespace churning flag to prevent non namespaced objects to be churned
 		if !ex.nsRequired {
 			log.Info("No namespaces were created in this job, skipping churning stage")
 			return nil
@@ -423,6 +627,18 @@ func (ex *JobExecutor) churnNamespaces(ctx context.Context) []error {
 	}
 	numToChurn := int(math.Max(float64(ex.ChurnConfig.Percent*len(jobNamespaces.Items)/100), 1))
 
+	// Get max namespacesPerObject for alignment
+	maxNpo := ex.getMaxNamespacesPerObject()
+	if maxNpo > 1 {
+		// Align numToChurn to be a multiple of maxNpo (round up)
+		numToChurn = ((numToChurn + maxNpo - 1) / maxNpo) * maxNpo
+		// Ensure we don't exceed available namespaces
+		if numToChurn > len(nsList) {
+			numToChurn = (len(nsList) / maxNpo) * maxNpo
+		}
+		log.Debugf("Aligned numToChurn to %d (maxNamespacesPerObject=%d)", numToChurn, maxNpo)
+	}
+
 	for {
 		var randStart int
 		if ex.ChurnConfig.Duration > 0 {
@@ -441,7 +657,17 @@ func (ex *JobExecutor) churnNamespaces(ctx context.Context) []error {
 		}
 
 		// Max amount of churn is 100% of namespaces
-		if len(nsList)-numToChurn+1 > 0 {
+		// Align randStart to maxNpo boundaries for proper shared object handling
+		if maxNpo > 1 {
+			// Calculate number of valid starting positions (aligned to maxNpo)
+			maxValidStart := len(nsList) - numToChurn
+			numValidPositions := (maxValidStart / maxNpo) + 1
+			if numValidPositions > 0 {
+				randStart = rand.Intn(numValidPositions) * maxNpo
+			}
+			log.Debugf("Selected aligned randStart=%d (maxNpo=%d, numValidPositions=%d)",
+				randStart, maxNpo, numValidPositions)
+		} else if len(nsList)-numToChurn+1 > 0 {
 			randStart = rand.Intn(len(nsList) - numToChurn + 1)
 		}
 		// We need to perform a natural sort
@@ -463,7 +689,9 @@ func (ex *JobExecutor) churnNamespaces(ctx context.Context) []error {
 		}
 		// 1 hour timeout to delete namespace
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Hour)
-		util.CleanupNamespacesByLabel(cleanupCtx, ex.clientSet, config.KubeBurnerLabelChurnDelete)
+		util.CleanupNamespacesByLabelNoWait(cleanupCtx, ex.clientSet, config.KubeBurnerLabelChurnDelete)
+		// Delete shared cluster-scoped objects that serve the churned namespaces
+		ex.deleteSharedObjectsForIterations(cleanupCtx, randStart, numToChurn+randStart)
 		if ex.ChurnConfig.DeleteDelay > 0 {
 			log.Infof("Sleeping for %v after deletion", ex.ChurnConfig.DeleteDelay)
 			time.Sleep(ex.ChurnConfig.DeleteDelay)
@@ -505,6 +733,13 @@ func (ex *JobExecutor) churnObjects(ctx context.Context) {
 		}
 		log.Infof("Deleting objects in churn cycle %d", cyclesCount)
 		for _, obj := range ex.objects {
+			// Skip shared objects from individual churn - they're cluster-scoped
+			// and shouldn't be churned independently of their namespaces
+			if obj.NamespacesPerObject > 1 {
+				log.Debugf("Skipping %s from object churn (namespacesPerObject=%d)",
+					obj.ObjectTemplate, obj.NamespacesPerObject)
+				continue
+			}
 			// if churning is enabled for the object
 			if obj.Churn {
 				labelSelector := obj.LabelSelector

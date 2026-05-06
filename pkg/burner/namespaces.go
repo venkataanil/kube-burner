@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/kube-burner/kube-burner/v2/pkg/config"
-	"github.com/kube-burner/kube-burner/v2/pkg/util"
 	log "github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -58,6 +57,7 @@ func CleanupNamespaceResourcesByLabel(ctx context.Context, ex JobExecutor, obj *
 		log.Debugf("Deleting %d %ss labeled with %s in %s", len(resources.Items), obj.Kind, labelSelector, namespace)
 	}
 	for _, item := range resources.Items {
+		ex.limiter.Wait(ctx)
 		if err := resourceInterface.Delete(ctx, item.GetName(), metav1.DeleteOptions{PropagationPolicy: ptr.To(metav1.DeletePropagationForeground)}); err != nil {
 			if !errors.IsNotFound(err) {
 				log.Errorf("Error deleting %v/%v in %v: %v", item.GetKind(), item.GetName(), namespace, err)
@@ -76,7 +76,14 @@ func CleanupNonNamespacedResourcesByLabel(ctx context.Context, ex JobExecutor, o
 	}
 	if len(resources.Items) > 0 {
 		log.Infof("Deleting %d %ss labeled with %s", len(resources.Items), object.Kind, labelSelector)
-		util.DeleteNonNamespacedResources(ctx, resources, resourceInterface)
+		for _, item := range resources.Items {
+			ex.limiter.Wait(ctx)
+			if err := resourceInterface.Delete(ctx, item.GetName(), metav1.DeleteOptions{}); err != nil {
+				if !errors.IsNotFound(err) {
+					log.Errorf("Error deleting %v/%v: %v", item.GetKind(), item.GetName(), err)
+				}
+			}
+		}
 	}
 }
 
